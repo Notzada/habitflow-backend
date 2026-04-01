@@ -284,6 +284,22 @@ app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'HabitFlow Bot', timestamp: new Date().toISOString() });
 });
 
+
+console.log("ANTES DE SALVAR:", interpreted.data);
+
+const { data, error } = await supabase
+  .from('expenses')
+  .insert([{
+    description: interpreted.data.description,
+    amount: interpreted.data.amount,
+    category: interpreted.data.category
+  }]);
+
+if (error) {
+  console.log("ERRO AO SALVAR:", error);
+} else {
+  console.log("SALVO COM SUCESSO:", data);
+}
 // ============================================
 // INICIALIZAÇÃO
 // ============================================
