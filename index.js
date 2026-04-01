@@ -20,7 +20,7 @@ const WEBHOOK_URL    = process.env.WEBHOOK_URL; // URL do seu Render.com
 // --- Clientes ---
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const genAI    = new GoogleGenerativeAI(GEMINI_KEY);
-const model = genAI.getGenerativeModel({ model: 'gemini-pro' });
+const model = genAI.getGenerativeModel({ model: 'gemini-flash-latest' });
 
 // ============================================
 // TELEGRAM: registrar webhook automaticamente
