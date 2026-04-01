@@ -3,6 +3,8 @@
 // Telegram Bot + Gemini AI + Supabase
 // ============================================
 
+
+
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
