@@ -2,6 +2,11 @@
 // NEXORAFLOW BACKEND
 // Telegram Bot + Gemini AI + Supabase
 // Sistema Híbrido: Regex (comandos simples) + IA (mensagens complexas)
+//
+// SCHEMA UPDATE: rode no Supabase SQL Editor:
+// ALTER TABLE expenses ADD COLUMN IF NOT EXISTS installments int default 1;
+// ALTER TABLE expenses ADD COLUMN IF NOT EXISTS installment_current int default 1;
+// ALTER TABLE expenses ADD COLUMN IF NOT EXISTS installment_group uuid;
 // ============================================
 
 const express = require('express');
@@ -33,7 +38,6 @@ async function registerWebhook() {
 
 // ============================================
 // CAMADA 1 — REGEX: comandos simples e diretos
-// Resolve sem consumir nenhuma chamada de IA.
 // ============================================
 
 const CATEGORY_MAP = {
@@ -92,9 +96,18 @@ const QUERY_KEYWORDS = [
   { regex: /\/metas/i,                                                              question: 'metas' },
 ];
 
-// "gastei 20 com almoço" / "paguei 50 reais de uber" / "comprei remédio por 45"
-const EXPENSE_REGEX     = /(?:gastei|paguei|comprei|custou|cobrou|desembolsei|gasto de|gasto com)\s+(?:r\$\s*)?(\d+[\.,]?\d*)\s*(?:reais?|r\$)?\s*(?:(?:com|de|no?|na|em|por|pelo?|pela)\s+(.+))?/i;
-const EXPENSE_REGEX_ALT = /(?:r\$\s*)?(\d+[\.,]?\d*)\s*(?:reais?)?\s*(?:de|no?|na|em|com)\s+(.+)/i;
+// Detecção de parcelamento no texto
+// Exemplos: "em 3x", "3 vezes", "parcelado em 6x", "12 parcelas", "em 10 vezes"
+const INSTALLMENT_REGEX = /(?:parcelado\s+)?em\s+(\d+)\s*[xX×]|(\d+)\s*[xX×]|(\d+)\s+(?:vezes|parcelas?)/i;
+
+// Gasto principal
+const EXPENSE_REGEX     = /(?:gastei|paguei|comprei|custou|cobrou|desembolsei|gasto de|gasto com)\s+(?:r\$\s*)?(\d+[\.,]?\d*)\s*(?:reais?|r\$)?\s*(?:(?:com|de|no?|na|em(?!\s+\d)|por|pelo?|pela)\s+(.+))?/i;
+const EXPENSE_REGEX_ALT = /(?:r\$\s*)?(\d+[\.,]?\d*)\s*(?:reais?)?\s*(?:de|no?|na|com)\s+(.+)/i;
+
+// Remoção de gasto pelo Telegram
+// Exemplos: "remover gasto almoço", "excluir último gasto", "deletar gasto uber", "cancelar último lançamento"
+const DELETE_EXPENSE_REGEX = /(?:remov[ae]r?|exclu[íi]r?|delet[ae]r?|cancela[r]?|apaga[r]?)\s+(?:o\s+)?(?:[úu]ltimo\s+)?(?:gasto|lan[çc]amento|despesa)(?:\s+(?:do|de|da|com|no?|na)\s+(.+))?/i;
+const DELETE_LAST_REGEX    = /(?:remov[ae]r?|exclu[íi]r?|delet[ae]r?|cancela[r]?|apaga[r]?)\s+(?:o\s+)?[úu]ltimo/i;
 
 const TASK_REGEX = /(?:preciso|lembrar de|n[ãa]o esquecer de|anota[r]?|add tarefa|tarefa:|todo:)\s+(.+)/i;
 
@@ -105,8 +118,24 @@ function detectCategory(text) {
   return 'Outros';
 }
 
+// Extrai o número de parcelas de um texto, retorna 1 se não encontrar
+function detectInstallments(text) {
+  const m = INSTALLMENT_REGEX.exec(text);
+  if (!m) return 1;
+  const n = parseInt(m[1] || m[2] || m[3], 10);
+  return (n >= 2 && n <= 72) ? n : 1;
+}
+
 function tryRegex(text) {
   const t = text.trim();
+
+  // DELETE EXPENSE (antes das queries para não conflitar)
+  if (DELETE_LAST_REGEX.test(t) || DELETE_EXPENSE_REGEX.test(t)) {
+    const descMatch = DELETE_EXPENSE_REGEX.exec(t);
+    const keyword   = descMatch?.[1]?.trim() || null;
+    console.log('⚡ [REGEX] delete_expense → keyword:', keyword);
+    return { type: 'delete_expense', data: { keyword }, reply: null, _source: 'regex' };
+  }
 
   // QUERY
   for (const { regex, question } of QUERY_KEYWORDS) {
@@ -116,7 +145,7 @@ function tryRegex(text) {
     }
   }
 
-  // HÁBITO — precisa de verbo de conclusão para não confundir com gasto
+  // HÁBITO
   for (const { regex, name, emoji } of HABIT_KEYWORDS) {
     if (/fiz|fui|completei|terminei|realizei|pratiquei|treinei|li|corri|bebi|meditei/i.test(t) && regex.test(t)) {
       console.log('⚡ [REGEX] habit →', name);
@@ -129,17 +158,20 @@ function tryRegex(text) {
     }
   }
 
-  // GASTO
+  // GASTO (com detecção de parcelamento)
   let match = EXPENSE_REGEX.exec(t) || EXPENSE_REGEX_ALT.exec(t);
   if (match) {
-    const amount      = parseFloat(match[1].replace(',', '.'));
-    const description = (match[2] || t).trim().replace(/\.$/, '');
-    const category    = detectCategory(description + ' ' + t);
-    console.log('⚡ [REGEX] expense →', { amount, description, category });
+    const amount       = parseFloat(match[1].replace(',', '.'));
+    const description  = (match[2] || t).trim().replace(/\.$/, '');
+    const category     = detectCategory(description + ' ' + t);
+    const installments = detectInstallments(t);
+    console.log('⚡ [REGEX] expense →', { amount, description, category, installments });
     return {
       type: 'expense',
-      data: { description, amount, category },
-      reply: `💸 *R$${amount.toFixed(2)}* em *${description}* registrado! (${category})`,
+      data: { description, amount, category, installments },
+      reply: installments > 1
+        ? `💳 *${description}* — R$${amount.toFixed(2)} em *${installments}x de R$${(amount/installments).toFixed(2)}* registrado! (${category})`
+        : `💸 *R$${amount.toFixed(2)}* em *${description}* registrado! (${category})`,
       _source: 'regex'
     };
   }
@@ -157,12 +189,11 @@ function tryRegex(text) {
     };
   }
 
-  return null; // cai para IA
+  return null;
 }
 
 // ============================================
 // CAMADA 2 — GEMINI: mensagens complexas/ambíguas
-// Só chamado quando o Regex não resolveu.
 // ============================================
 async function interpretWithAI(text) {
   console.log('🤖 [GEMINI] chamando IA para:', text);
@@ -175,13 +206,18 @@ Mensagem: "${text}"
 
 Categorias de gastos válidas: Alimentação, Transporte, Lazer, Saúde, Casa, Educação, Roupas, Outros
 
+Se a mensagem mencionar parcelamento (ex: "em 3x", "parcelado em 6 vezes"), extraia o número de parcelas.
+Se mencionar remoção/exclusão de gasto, use type "delete_expense" com keyword do que remover.
+
 Retorne um JSON com EXATAMENTE este formato:
 {
-  "type": "expense" | "habit" | "task" | "query" | "unknown",
+  "type": "expense" | "habit" | "task" | "query" | "delete_expense" | "unknown",
   "data": {
     "description": "descrição",
     "amount": 0.0,
     "category": "Alimentação",
+    "installments": 1,
+    "keyword": "palavra-chave para encontrar o gasto a remover",
     "name": "nome do hábito",
     "text": "descrição da tarefa",
     "tag": "Pessoal",
@@ -217,12 +253,44 @@ async function interpretMessage(text) {
 // ============================================
 // SUPABASE: salvar
 // ============================================
-async function saveExpense({ description, amount, category }) {
-  const { error } = await supabase.from('expenses').insert([{
-    description, amount: parseFloat(amount), category: category || 'Outros', source: 'telegram'
-  }]);
-  if (error) console.error('ERRO AO SALVAR GASTO:', error);
-  else console.log('✅ Gasto salvo:', description, amount);
+async function saveExpense({ description, amount, category, installments = 1 }) {
+  const n = parseInt(installments, 10) || 1;
+
+  if (n <= 1) {
+    // Gasto simples
+    const { error } = await supabase.from('expenses').insert([{
+      description, amount: parseFloat(amount), category: category || 'Outros', source: 'telegram',
+      installments: 1, installment_current: 1
+    }]);
+    if (error) console.error('ERRO AO SALVAR GASTO:', error);
+    else console.log('✅ Gasto salvo:', description, amount);
+    return;
+  }
+
+  // Parcelamento — gera um UUID de grupo e insere N registros (um por mês)
+  const groupId    = crypto.randomUUID();
+  const parcela    = parseFloat(amount) / n;
+  const baseDate   = new Date();
+  const rows = [];
+
+  for (let i = 0; i < n; i++) {
+    const d = new Date(baseDate);
+    d.setMonth(d.getMonth() + i);
+    rows.push({
+      description:          `${description} (${i+1}/${n})`,
+      amount:               parseFloat(parcela.toFixed(2)),
+      category:             category || 'Outros',
+      source:               'telegram',
+      installments:         n,
+      installment_current:  i + 1,
+      installment_group:    groupId,
+      created_at:           d.toISOString(),
+    });
+  }
+
+  const { error } = await supabase.from('expenses').insert(rows);
+  if (error) console.error('ERRO AO SALVAR PARCELAS:', error);
+  else console.log(`✅ ${n} parcelas salvas para "${description}"`);
 }
 
 async function saveHabitLog(habitName) {
@@ -241,6 +309,52 @@ async function saveHabitLog(habitName) {
 
 async function saveTask({ text, tag }) {
   await supabase.from('tasks').insert({ text, tag: tag || 'Geral' });
+}
+
+// ============================================
+// SUPABASE: remoção de gasto via Telegram
+// ============================================
+async function deleteExpenseByKeyword(keyword) {
+  // Busca os últimos 10 gastos
+  const { data } = await supabase
+    .from('expenses')
+    .select('id, description, amount, category, installment_group')
+    .order('created_at', { ascending: false })
+    .limit(10);
+
+  if (!data || !data.length) return 'Nenhum gasto encontrado para remover.';
+
+  let target = null;
+
+  if (keyword) {
+    // Tenta encontrar pelo keyword (busca parcial, case insensitive)
+    target = data.find(e =>
+      e.description.toLowerCase().includes(keyword.toLowerCase())
+    );
+  }
+
+  // Se não achou pelo keyword ou não veio keyword, pega o mais recente
+  if (!target) target = data[0];
+
+  // Se for parcelado, remove todas as parcelas do grupo
+  if (target.installment_group) {
+    const { error } = await supabase
+      .from('expenses')
+      .delete()
+      .eq('installment_group', target.installment_group);
+
+    if (error) return '❌ Erro ao remover parcelas.';
+
+    // Conta quantas foram
+    const count = data.filter(e => e.installment_group === target.installment_group).length;
+    const baseName = target.description.replace(/\s*\(\d+\/\d+\)$/, '');
+    return `🗑️ Parcelamento *${baseName}* removido (${target.installments} parcelas excluídas).`;
+  }
+
+  // Gasto simples
+  const { error } = await supabase.from('expenses').delete().eq('id', target.id);
+  if (error) return '❌ Erro ao remover gasto.';
+  return `🗑️ Gasto removido: *${target.description}* — R$${parseFloat(target.amount).toFixed(2)}`;
 }
 
 // ============================================
@@ -318,17 +432,16 @@ app.post('/webhook', async (req, res) => {
   if (text === '/start') {
     return sendTelegram(chatId,
       `👋 *Olá! Sou o bot do NexoraFlow!*\n\n` +
-      `Você pode me mandar mensagens como:\n\n` +
       `💸 "gastei 45 reais no almoço"\n` +
-      `💸 "paguei 120 de uber"\n` +
+      `💳 "paguei 1200 de tv em 12x"\n` +
+      `💳 "comprei tênis 300 parcelado em 3 vezes"\n` +
       `✅ "fiz academia hoje"\n` +
       `📋 "preciso comprar remédio"\n` +
+      `🗑️ "remover gasto uber" / "excluir último gasto"\n` +
       `📊 "quanto gastei essa semana?"\n` +
-      `📊 "quanto gastei esse mês?"\n` +
-      `📊 "gastos de hoje"\n` +
       `🎯 "minhas metas"\n\n` +
-      `Atalhos rápidos: /gastos /habitos /metas\n\n` +
-      `Tudo aparece no seu dashboard em tempo real! 🚀`
+      `Atalhos: /gastos /habitos /metas\n\n` +
+      `Tudo no seu dashboard em tempo real! 🚀`
     );
   }
 
@@ -343,12 +456,19 @@ app.post('/webhook', async (req, res) => {
     case 'expense':
       await saveExpense(interpreted.data);
       break;
+
+    case 'delete_expense':
+      reply = await deleteExpenseByKeyword(interpreted.data?.keyword);
+      break;
+
     case 'habit':
       await saveHabitLog(interpreted.data.name);
       break;
+
     case 'task':
       await saveTask(interpreted.data);
       break;
+
     case 'query': {
       const q = interpreted.data.question;
       if      (q === 'gastos' || q === 'resumo')   reply = await getWeeklyExpenses();
